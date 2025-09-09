@@ -1,14 +1,12 @@
 // api/submit.js — Vercel Serverless (CommonJS)
 
 const TOKEN   = process.env.TG_TOKEN;
-const CHAT_ID = process.env.TG_CHAT;   // публичный канал "Заявки БСЗ"
-const ADMIN_ID= process.env.TG_ADMIN;  // админ-канал "полная информация"
-
-// comma-separated allowlist: "https://gkbsz.su,https://www.gkbsz.su"
+const CHAT_ID = process.env.TG_CHAT;
+const ADMIN_ID= process.env.TG_ADMIN;
 const ORIGINS = String(process.env.ALLOW_ORIGIN || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
-// ---------- helpers ----------
+// ----- helpers -----
 function allowOrigin(origin){ return ORIGINS.length ? (ORIGINS.includes(origin)? origin : null) : '*'; }
 function setCors(res, origin){
   const allowed = allowOrigin(origin);
@@ -24,6 +22,7 @@ function getIP(req){ const xf=req.headers['x-forwarded-for']; if(typeof xf==='st
 const EMAIL_RE=/^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
 const E164_RE=/^\+\d{8,15}$/;
 
+// страна по коду
 function countryByDial(d){
   d=String(d||'').replace(/^\+/,'');
   if(d.startsWith('7'))   return 'Россия';
@@ -37,6 +36,17 @@ function countryByDial(d){
   if(d.startsWith('993')) return 'Туркменистан';
   return '';
 }
+
+// аккуратно извлечь ТОЛЬКО код страны из e164, если dialCode не пришёл
+function extractDialFromE164(e164){
+  const s = String(e164||'').replace(/^\+/,'');
+  // сначала длинные коды
+  const known = ['375','380','998','996','995','994','993','992','374'];
+  for (const code of known){ if (s.startsWith(code)) return code; }
+  if (s.startsWith('7')) return '7';
+  return s ? s[0] : '';
+}
+
 const boolRu = b => (b ? 'да' : 'нет');
 
 async function tgSend(chatId, text){
@@ -49,7 +59,7 @@ async function tgSend(chatId, text){
   if(!r.ok){ const t=await r.text().catch(()=> ''); throw new Error(`Telegram ${r.status}: ${t}`); }
 }
 
-// ---------- handler ----------
+// ----- handler -----
 module.exports = async (req,res)=>{
   const origin = String(req.headers.origin||'');
 
@@ -72,8 +82,8 @@ module.exports = async (req,res)=>{
 
   const name   = String(body.name||'').trim();
   const email  = String(body.email||'').trim();
-  const phoneN = String(body.phone||'').trim();      // "(927) 127-85-33"
-  const phoneE = String(body.phone_e164||'').trim(); // "+79271278533"
+  const phoneN = String(body.phone||'').trim();      // например: "(927) 127-85-33"
+  const phoneE = String(body.phone_e164||'').trim(); // например: "+79271278533"
   const subscribe = !!body.subscribe;
   const policyVersion = String(body.policy_version||'').trim();
   const pageUrl = String(body.url||'').trim();
@@ -82,7 +92,7 @@ module.exports = async (req,res)=>{
   const t  = Number(body.t||0);
 
   const countryName = String(body.countryName||'').trim();
-  const dialCode = String(body.dialCode||'').trim(); // "7"
+  let dialCode = String(body.dialCode||'').trim();   // "7" если пришло с фронта
 
   if(hp) return ok(res, origin, { ok:true, skipped:true, reason:'honeypot' });
   if(t && t<600) return ok(res, origin, { ok:true, skipped:true, reason:'timer' });
@@ -91,20 +101,20 @@ module.exports = async (req,res)=>{
   if(!email || !EMAIL_RE.test(email)) return bad(res, origin, 'Неверный email');
   if(!phoneE || !E164_RE.test(phoneE)) return bad(res, origin, 'Неверный телефон');
 
-  const country = countryName || countryByDial(dialCode?`+${dialCode}`:'') || countryByDial(phoneE) || '';
+  // если dialCode не получили — вытащим из e164
+  if(!dialCode) dialCode = extractDialFromE164(phoneE);
 
-  // телефон в коротком сообщении: обязательно с кодом страны
-  const plusDial = dialCode ? `+${dialCode}` : (phoneE.match(/^\+\d+/)?.[0] || '');
-  const phoneShort = plusDial
-    ? (phoneN ? `${plusDial} ${phoneN}` : phoneE)
-    : (phoneN || phoneE);
+  const country = countryName || countryByDial(`+${dialCode}`) || countryByDial(phoneE) || '';
+
+  // В КОРОТКОМ СООБЩЕНИИ — РОВНО ОДИН НОМЕР С МАСКОЙ "+код (национальный)"
+  const phoneShort = phoneN ? `+${dialCode} ${phoneN}` : phoneE;
 
   const now = new Date();
   const timeRu = now.toLocaleString('ru-RU',{hour12:false,timeZone:'Europe/Moscow'});
   const ip = getIP(req);
   const referer = String(req.headers.referer||'');
 
-  // --- короткое сообщение (без пустых строк) ---
+  // короткое сообщение
   const shortText =
     `🎟 Новая заявка\n` +
     `Имя: ${name}\n` +
@@ -114,7 +124,7 @@ module.exports = async (req,res)=>{
     `Подписка: ${boolRu(subscribe)}\n` +
     `URL: ${pageUrl || referer || '-'}`;
 
-  // --- полное сообщение админам ---
+  // полное сообщение
   const fullText =
     `<b>Заявка (подробно)</b>\n` +
     `Имя: ${name}\n` +
