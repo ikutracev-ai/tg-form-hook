@@ -1,167 +1,211 @@
-// /pages/api/submit.ts  (или /api/submit.js для Vercel)
-// Node.js runtime
+// api/submit.js  — Node.js (Vercel Serverless Function, CommonJS)
 
-type Body = {
-  name: string;
-  email: string;
-  phone: string;       // как в инпуте (национальный формат)
-  phone_e164: string;  // +79991234567
-  subscribe?: boolean;
-  policy_version?: string;
-  ua?: string;
-  url?: string;
-  hp?: string;         // honeypot
-  t?: number;          // таймер
-};
+const TOKEN = process.env.TG_TOKEN;
+const CHAT_ID = process.env.TG_CHAT;   // публичный канал "Заявки БСЗ"
+const ADMIN_ID = process.env.TG_ADMIN; // админ-канал "полная информация"
 
-const TG_TOKEN  = process.env.TG_TOKEN!;
-const TG_CHAT   = process.env.TG_CHAT!;   // канал "Заявки БСЗ" — короткое сообщение
-const TG_ADMIN  = process.env.TG_ADMIN!;  // канал/чат для полной информации
-
-// В .env (Vercel) заполни ТОЛЬКО ПОЛНЫЕ origin'ы через запятую!
-const ALLOW = (process.env.ALLOW_ORIGIN || '')
+// Белый список доменов для CORS (в точности как Origin браузера, включая схему)
+const ORIGINS = String(process.env.ALLOW_ORIGIN || '')
   .split(',')
   .map(s => s.trim())
-  .filter(Boolean); // например: http://gkbsz.su,https://gkbsz.su,http://www.gkbsz.su,https://www.gkbsz.su
+  .filter(Boolean);
 
-function isAllowedOrigin(origin?: string) {
-  if (!origin) return false;
-  // exact match
-  return ALLOW.includes(origin);
+// --- Helpers ---------------------------------------------------------------
+
+function allowOrigin(origin) {
+  return ORIGINS.length === 0 ? '*' : (ORIGINS.includes(origin) ? origin : null);
 }
 
-function corsHeaders(origin: string) {
-  return {
-    'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'content-type',
-    'Vary': 'Origin',
+function setCors(res, origin) {
+  const allowed = allowOrigin(origin);
+  if (allowed) {
+    res.setHeader('Access-Control-Allow-Origin', allowed);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+function json(res, status, data) {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(data));
+}
+
+function ok(res, origin, payload = { ok: true }) {
+  setCors(res, origin);
+  json(res, 200, payload);
+}
+
+function bad(res, origin, message, code = 400) {
+  setCors(res, origin);
+  json(res, code, { ok: false, error: message });
+}
+
+function getIP(req) {
+  const xf = req.headers['x-forwarded-for'];
+  if (typeof xf === 'string' && xf.length) return xf.split(',')[0].trim();
+  return req.socket?.remoteAddress || '';
+}
+
+// Простая проверка email
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
+// E.164: + и 8–15 цифр
+const E164_RE = /^\+\d{8,15}$/;
+
+// Страна по телефонному коду (минимально нужные)
+function countryByDial(dial) {
+  const d = String(dial || '').replace(/^\+/, '');
+  // приоритетные
+  if (d.startsWith('7')) return 'Россия';        // (для наших задач — Россия)
+  if (d.startsWith('375')) return 'Беларусь';
+  if (d.startsWith('380')) return 'Украина';
+  if (d.startsWith('76') || d.startsWith('77')) return 'Казахстан';
+  if (d.startsWith('374')) return 'Армения';
+  if (d.startsWith('998')) return 'Узбекистан';
+  if (d.startsWith('996')) return 'Киргизия';
+  if (d.startsWith('992')) return 'Таджикистан';
+  if (d.startsWith('993')) return 'Туркменистан';
+  // дефолт
+  return '';
+}
+
+function boolToRu(b) {
+  return b ? 'да' : 'нет';
+}
+
+async function tgSend(chatId, text) {
+  if (!TOKEN || !chatId) return;
+  const url = `https://api.telegram.org/bot${TOKEN}/sendMessage`;
+  const body = {
+    chat_id: chatId,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
   };
-}
-
-// Определение страны по E.164
-function countryFromE164(e164: string): string {
-  // нормализуем
-  const n = e164.replace(/\s+/g, '');
-  if (!n.startsWith('+')) return '—';
-
-  // самые частые коды; отсортировано по длине кода (длинные — раньше)
-  const table: Array<[RegExp, string]> = [
-    [/^\+375/, 'Беларусь'],
-    [/^\+380/, 'Украина'],
-    [/^\+373/, 'Молдова'],
-    [/^\+374/, 'Армения'],
-    [/^\+992/, 'Таджикистан'],
-    [/^\+993/, 'Туркменистан'],
-    [/^\+994/, 'Азербайджан'],
-    [/^\+995/, 'Грузия'],
-    [/^\+996/, 'Киргизия'],
-    [/^\+998/, 'Узбекистан'],
-    [/^\+1/,   'США/Канада'],
-    // +7: Россия или Казахстан
-    [/^\+7(7|70)/, 'Казахстан'], // большинство номеров KZ начинаются на +77 / +770
-    [/^\+7/,      'Россия'],
-  ];
-  for (const [re, name] of table) if (re.test(n)) return name;
-  return '—';
-}
-
-function safeText(s: string) {
-  return (s || '').toString().trim().slice(0, 500);
-}
-
-async function sendTelegram(chatId: string, text: string) {
-  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+  const r = await fetch(url, {
     method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: false }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
-  const data = await r.json();
-  if (!r.ok || !data.ok) throw new Error(`TG error: ${r.status} ${data?.description || ''}`);
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error(`Telegram error ${r.status}: ${t}`);
+  }
 }
 
-export default async function handler(req: any, res: any) {
-  const origin = req.headers.origin as string | undefined;
+// --- Handler ---------------------------------------------------------------
 
-  // --- CORS preflight ---
+module.exports = async (req, res) => {
+  const origin = String(req.headers.origin || '');
+
+  // CORS preflight
   if (req.method === 'OPTIONS') {
-    if (origin && isAllowedOrigin(origin)) {
-      res.setHeader('Access-Control-Max-Age', '86400');
-      Object.entries(corsHeaders(origin)).forEach(([k, v]) => res.setHeader(k, v));
-      return res.status(200).end();
-    }
-    return res.status(403).end('Origin not allowed');
+    const allowed = allowOrigin(origin);
+    if (!allowed) return bad(res, origin, 'Origin not allowed', 403);
+    setCors(res, origin);
+    res.statusCode = 200;
+    return res.end();
   }
 
-  // Разрешаем только POST с разрешённого Origin
-  if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method not allowed' });
-  if (!origin || !isAllowedOrigin(origin)) return res.status(403).json({ ok:false, error:'Origin not allowed' });
+  if (req.method !== 'POST') {
+    return bad(res, origin, 'Method not allowed', 405);
+  }
 
-  // Всегда возвращаем соответствующие CORS заголовки
-  Object.entries(corsHeaders(origin)).forEach(([k, v]) => res.setHeader(k, v));
+  // Проверка Origin
+  if (ORIGINS.length && !ORIGINS.includes(origin)) {
+    return bad(res, origin, 'Origin not allowed', 403);
+  }
+
+  // Парсинг тела
+  let body = req.body;
+  if (!body) {
+    try {
+      const raw = await new Promise((resolve, reject) => {
+        let data = '';
+        req.on('data', c => (data += c));
+        req.on('end', () => resolve(data));
+        req.on('error', reject);
+      });
+      body = raw ? JSON.parse(raw) : {};
+    } catch {
+      return bad(res, origin, 'Invalid JSON', 400);
+    }
+  }
+
+  // Достаём поля
+  const name = String(body.name || '').trim();
+  const email = String(body.email || '').trim();
+  const phoneNational = String(body.phone || '').trim();      // "(993) 497-85-33"
+  const phoneE164 = String(body.phone_e164 || '').trim();     // "+79934978533"
+  const subscribe = Boolean(body.subscribe);
+  const policyVersion = String(body.policy_version || '').trim();
+  const url = String(body.url || '').trim();
+  const ua = String(body.ua || '').trim();
+  const hp = String(body.hp || '').trim(); // honeypot
+  const t = Number(body.t || 0);
+
+  // Доп.поля с фронта (если есть)
+  const countryName = String(body.countryName || '').trim();
+  const dialCode = String(body.dialCode || '').trim(); // например "7"
+
+  // Антибот
+  if (hp) return ok(res, origin, { ok: true, skipped: true, reason: 'honeypot' });
+  if (t && t < 600) return ok(res, origin, { ok: true, skipped: true, reason: 'timer' });
+
+  // Серверная валидация
+  if (!name) return bad(res, origin, 'Укажите имя');
+  if (!email || !EMAIL_RE.test(email)) return bad(res, origin, 'Неверный email');
+  if (!phoneE164 || !E164_RE.test(phoneE164)) return bad(res, origin, 'Неверный телефон');
+
+  // Страна: приоритет countryName -> dialCode -> phoneE164
+  const country =
+    countryName ||
+    countryByDial(dialCode ? `+${dialCode}` : '') ||
+    countryByDial(phoneE164);
+
+  // Время/технические детали
+  const now = new Date();
+  const timeRu = now.toLocaleString('ru-RU', { hour12: false, timeZone: 'Europe/Moscow' });
+  const ip = getIP(req);
+  const referer = String(req.headers.referer || '');
+
+  // --- ТЕКСТЫ ДЛЯ TELEGRAM -----------------------------------------------
+
+  // Короткая версия (публичный канал)
+  const shortText =
+    `🎟 Новая заявка\n` +
+    `Имя: ${name}\n` +
+    `Email: ${email}\n` +
+    (country ? `Страна: ${country}\n\n` : `\n`) +
+    `Телефон: ${phoneNational || phoneE164}\n` +
+    `Подписка: ${boolToRu(subscribe)}\n\n` +
+    `URL: ${url || referer || '-'}`;
+
+  // Полная версия (админ-канал)
+  const fullText =
+    `<b>Заявка (подробно)</b>\n` +
+    `Имя: ${name}\n` +
+    `Email: ${email}\n` +
+    `Телефон: ${phoneNational || '-'}\n` +
+    `E164: ${phoneE164}\n` +
+    (country ? `Страна: ${country}\n` : '') +
+    `Подписка: ${boolToRu(subscribe)}\n` +
+    (policyVersion ? `Политика: ${policyVersion}\n` : '') +
+    `Когда: ${timeRu}\n` +
+    `URL: ${url || referer || '-'}\n` +
+    `UA: ${ua || '-'}\n` +
+    `IP: ${ip || '-'}\n` +
+    `Origin: ${origin || '-'}`;
 
   try {
-    const body: Body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    // сначала админ, потом публичный (чтобы при сбое было что посмотреть)
+    await tgSend(ADMIN_ID, fullText);
+    await tgSend(CHAT_ID, shortText);
 
-    // Honeypot/минимальная валидация
-    if (safeText(body.hp)) return res.status(200).json({ ok:true, spam:true });
-    const name  = safeText(body.name);
-    const email = safeText(body.email);
-    const phone = safeText(body.phone);
-    const e164  = safeText(body.phone_e164);
-    const url   = safeText(body.url);
-    const subscribe = !!body.subscribe;
-
-    if (!name)  return res.status(400).json({ ok:false, error:'name' });
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ ok:false, error:'email' });
-    if (!e164 || !/^\+\d{8,15}$/.test(e164)) return res.status(400).json({ ok:false, error:'phone' });
-
-    const country = countryFromE164(e164);
-
-    // --- Текст для канала (Заявки БСЗ) ---
-    const short =
-`🎟 Новая заявка
-Имя: ${name}
-Email: ${email}
-Страна: ${country}
-
-Телефон: ${phone || e164}
-Подписка: ${subscribe ? 'да' : 'нет'}
-
-URL: ${url || '—'}`;
-
-    // --- Текст для админ-канала (полная) ---
-    const ip  = (req.headers['x-real-ip'] as string) || (req.headers['x-forwarded-for'] as string) || '';
-    const ua  = safeText(body.ua || req.headers['user-agent'] as string);
-    const when= new Date().toISOString().replace('T',' ').slice(0,19);
-
-    const full =
-`📄 Заявка (подробно)
-Имя: ${name}
-Email: ${email}
-Телефон: ${phone}
-E164: ${e164}
-Страна: ${country}
-Подписка: ${subscribe ? 'да' : 'нет'}
-Политика: ${safeText(body.policy_version) || '—'}
-Когда: ${when}
-URL: ${url || '—'}
-UA: ${ua}
-IP: ${ip}
-Origin: ${origin}`;
-
-    // Отправляем в телеграм
-    await Promise.all([
-      sendTelegram(TG_CHAT,  short),
-      sendTelegram(TG_ADMIN, full),
-      // превью сайта (картинка/сниппет) — по желанию в оба чата:
-      url ? sendTelegram(TG_CHAT,  url) : null,
-      url ? sendTelegram(TG_ADMIN, url) : null,
-    ]);
-
-    return res.status(200).json({ ok:true });
-  } catch (e: any) {
-    console.error('submit error', e);
-    return res.status(500).json({ ok:false, error: e?.message || 'internal' });
+    return ok(res, origin, { ok: true });
+  } catch (e) {
+    console.error(e);
+    return bad(res, origin, 'Telegram send failed', 502);
   }
-}
+};
