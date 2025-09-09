@@ -1,169 +1,167 @@
-// api/submit.js
-export default async function handler(req, res) {
-  // --- CORS ---
-  const ALLOW = (process.env.ALLOW_ORIGIN || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+// /pages/api/submit.ts  (или /api/submit.js для Vercel)
+// Node.js runtime
 
-  const origin = req.headers.origin;
-  if (origin && ALLOW.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  } else {
-    res.setHeader('Access-Control-Allow-Origin', ALLOW[0] || '*');
-  }
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+type Body = {
+  name: string;
+  email: string;
+  phone: string;       // как в инпуте (национальный формат)
+  phone_e164: string;  // +79991234567
+  subscribe?: boolean;
+  policy_version?: string;
+  ua?: string;
+  url?: string;
+  hp?: string;         // honeypot
+  t?: number;          // таймер
+};
 
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') {
-    return res.status(405).json({ ok: false, error: 'Method not allowed' });
+const TG_TOKEN  = process.env.TG_TOKEN!;
+const TG_CHAT   = process.env.TG_CHAT!;   // канал "Заявки БСЗ" — короткое сообщение
+const TG_ADMIN  = process.env.TG_ADMIN!;  // канал/чат для полной информации
+
+// В .env (Vercel) заполни ТОЛЬКО ПОЛНЫЕ origin'ы через запятую!
+const ALLOW = (process.env.ALLOW_ORIGIN || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean); // например: http://gkbsz.su,https://gkbsz.su,http://www.gkbsz.su,https://www.gkbsz.su
+
+function isAllowedOrigin(origin?: string) {
+  if (!origin) return false;
+  // exact match
+  return ALLOW.includes(origin);
+}
+
+function corsHeaders(origin: string) {
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'content-type',
+    'Vary': 'Origin',
+  };
+}
+
+// Определение страны по E.164
+function countryFromE164(e164: string): string {
+  // нормализуем
+  const n = e164.replace(/\s+/g, '');
+  if (!n.startsWith('+')) return '—';
+
+  // самые частые коды; отсортировано по длине кода (длинные — раньше)
+  const table: Array<[RegExp, string]> = [
+    [/^\+375/, 'Беларусь'],
+    [/^\+380/, 'Украина'],
+    [/^\+373/, 'Молдова'],
+    [/^\+374/, 'Армения'],
+    [/^\+992/, 'Таджикистан'],
+    [/^\+993/, 'Туркменистан'],
+    [/^\+994/, 'Азербайджан'],
+    [/^\+995/, 'Грузия'],
+    [/^\+996/, 'Киргизия'],
+    [/^\+998/, 'Узбекистан'],
+    [/^\+1/,   'США/Канада'],
+    // +7: Россия или Казахстан
+    [/^\+7(7|70)/, 'Казахстан'], // большинство номеров KZ начинаются на +77 / +770
+    [/^\+7/,      'Россия'],
+  ];
+  for (const [re, name] of table) if (re.test(n)) return name;
+  return '—';
+}
+
+function safeText(s: string) {
+  return (s || '').toString().trim().slice(0, 500);
+}
+
+async function sendTelegram(chatId: string, text: string) {
+  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: false }),
+  });
+  const data = await r.json();
+  if (!r.ok || !data.ok) throw new Error(`TG error: ${r.status} ${data?.description || ''}`);
+}
+
+export default async function handler(req: any, res: any) {
+  const origin = req.headers.origin as string | undefined;
+
+  // --- CORS preflight ---
+  if (req.method === 'OPTIONS') {
+    if (origin && isAllowedOrigin(origin)) {
+      res.setHeader('Access-Control-Max-Age', '86400');
+      Object.entries(corsHeaders(origin)).forEach(([k, v]) => res.setHeader(k, v));
+      return res.status(200).end();
+    }
+    return res.status(403).end('Origin not allowed');
   }
+
+  // Разрешаем только POST с разрешённого Origin
+  if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method not allowed' });
+  if (!origin || !isAllowedOrigin(origin)) return res.status(403).json({ ok:false, error:'Origin not allowed' });
+
+  // Всегда возвращаем соответствующие CORS заголовки
+  Object.entries(corsHeaders(origin)).forEach(([k, v]) => res.setHeader(k, v));
 
   try {
-    // --- Anti-bot / rate limit (Upstash REST) ---
-    const ip =
-      req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
-      req.headers['x-real-ip'] ||
-      req.socket.remoteAddress ||
-      '-';
+    const body: Body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
 
-    const limited = await isRateLimited(ip).catch(() => false);
-    if (limited) {
-      return res.status(429).json({ ok: false, error: 'Too Many Requests' });
-    }
+    // Honeypot/минимальная валидация
+    if (safeText(body.hp)) return res.status(200).json({ ok:true, spam:true });
+    const name  = safeText(body.name);
+    const email = safeText(body.email);
+    const phone = safeText(body.phone);
+    const e164  = safeText(body.phone_e164);
+    const url   = safeText(body.url);
+    const subscribe = !!body.subscribe;
 
-    const {
-      name = '',
-      email = '',
-      phone = '',
-      phone_e164 = '',
-      country_name = '',
-      country_iso = '',
-      country_dial = '',
-      subscribe = false,
-      policy_version = '',
-      ua = '',
-      url = '',
-      hp = '',
-      t = 0,
-    } = req.body || {};
+    if (!name)  return res.status(400).json({ ok:false, error:'name' });
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ ok:false, error:'email' });
+    if (!e164 || !/^\+\d{8,15}$/.test(e164)) return res.status(400).json({ ok:false, error:'phone' });
 
-    // honeypot / таймер
-    if (hp) return res.status(400).json({ ok: false, error: 'Bot detected' });
-    if (Number(t) < 600) {
-      return res.status(400).json({ ok: false, error: 'Bot detected' });
-    }
+    const country = countryFromE164(e164);
 
-    // серверная валидация
-    if (!name.trim() || !email.trim() || (!phone && !phone_e164)) {
-      return res.status(400).json({ ok: false, error: 'Missing required fields' });
-    }
-    const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-    if (!emailOk) {
-      return res.status(400).json({ ok: false, error: 'Invalid email' });
-    }
-    if (phone_e164 && !/^\+\d{8,15}$/.test(phone_e164)) {
-      return res.status(400).json({ ok: false, error: 'Invalid phone' });
-    }
-
-    const token = process.env.TG_TOKEN;
-    const chatId = process.env.TG_CHAT;   // публичный канал: короткая карточка
-    const adminId = process.env.TG_ADMIN; // админ-канал: полные данные
-    if (!token || !chatId || !adminId) {
-      return res.status(500).json({ ok: false, error: 'Server not configured: TG_TOKEN/TG_CHAT/TG_ADMIN' });
-    }
-
-    // аккуратный вид телефона для сообщений
-    const nat = (phone || '').replace(/^8\s*/, '').trim(); // если человек ввёл «8 …», уберём
-    const dial = (country_dial || '').toString().replace(/^\+/, '');
-    const phoneDisplay =
-      dial && nat ? `+${dial} ${nat}` : (phone_e164 || nat || '-');
-
-    const countryDisplay =
-      country_name || (dial ? `+${dial}` : '');
-
-    // ===== Сообщение в публичный канал =====
-    const shortText =
+    // --- Текст для канала (Заявки БСЗ) ---
+    const short =
 `🎟 Новая заявка
 Имя: ${name}
 Email: ${email}
-Страна: ${countryDisplay || '—'}
+Страна: ${country}
 
-Телефон: ${phoneDisplay}
+Телефон: ${phone || e164}
 Подписка: ${subscribe ? 'да' : 'нет'}
 
 URL: ${url || '—'}`;
 
-    // ===== Сообщение в админ-канал (подробно) =====
-    const now = new Date().toLocaleString('ru-RU');
-    const adminText =
-`Заявка БСЗ полная информация
-📄 Заявка (подробно)
+    // --- Текст для админ-канала (полная) ---
+    const ip  = (req.headers['x-real-ip'] as string) || (req.headers['x-forwarded-for'] as string) || '';
+    const ua  = safeText(body.ua || req.headers['user-agent'] as string);
+    const when= new Date().toISOString().replace('T',' ').slice(0,19);
+
+    const full =
+`📄 Заявка (подробно)
 Имя: ${name}
 Email: ${email}
-Телефон: ${phoneDisplay}
-E164: ${phone_e164 || '—'}
-Страна: ${country_name || '—'}${country_iso ? ` (${country_iso.toUpperCase()})` : ''}${dial ? `  +${dial}` : ''}
+Телефон: ${phone}
+E164: ${e164}
+Страна: ${country}
 Подписка: ${subscribe ? 'да' : 'нет'}
-Политика: ${policy_version || '—'}
-Когда: ${now}
+Политика: ${safeText(body.policy_version) || '—'}
+Когда: ${when}
 URL: ${url || '—'}
-UA: ${ua || req.headers['user-agent'] || '—'}
+UA: ${ua}
 IP: ${ip}
-Origin: ${origin || '—'}`;
+Origin: ${origin}`;
 
-    // Отправка в Телеграм
-    const tg = (text, id) =>
-      fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: id, text }),
-      });
-
-    const [pubRes, admRes] = await Promise.all([
-      tg(shortText, chatId),
-      tg(adminText, adminId),
+    // Отправляем в телеграм
+    await Promise.all([
+      sendTelegram(TG_CHAT,  short),
+      sendTelegram(TG_ADMIN, full),
+      // превью сайта (картинка/сниппет) — по желанию в оба чата:
+      url ? sendTelegram(TG_CHAT,  url) : null,
+      url ? sendTelegram(TG_ADMIN, url) : null,
     ]);
 
-    const ok = pubRes.ok && admRes.ok;
-    if (!ok) {
-      const a = await pubRes.json().catch(() => null);
-      const b = await admRes.json().catch(() => null);
-      return res.status(502).json({ ok: false, error: 'Telegram error', details: { pub: a, adm: b } });
-    }
-
-    return res.status(200).json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ ok: false, error: e.message });
+    return res.status(200).json({ ok:true });
+  } catch (e: any) {
+    console.error('submit error', e);
+    return res.status(500).json({ ok:false, error: e?.message || 'internal' });
   }
-}
-
-/* -------------------------------------------
-   Upstash REST rate-limit по IP (60/5мин)
--------------------------------------------- */
-async function isRateLimited(ip) {
-  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_API_URL;
-  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_API_TOKEN;
-  if (!url || !token) return false;
-
-  const key = `rl:${ip}`;
-  const windowSec = 300;  // 5 минут
-  const limit = 60;
-
-  // LUA скрипт: инкремент + TTL
-  const script =
-    "local c=redis.call('INCR', KEYS[1]); if c==1 then redis.call('EXPIRE', KEYS[1], ARGV[1]); end; return c";
-
-  const r = await fetch(`${url}/eval`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ script, keys: [key], args: [String(windowSec)] }),
-  });
-
-  const json = await r.json().catch(() => ({}));
-  const count = Number(json?.result ?? json);
-  return Number.isFinite(count) && count > limit;
 }
