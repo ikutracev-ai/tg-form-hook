@@ -1,228 +1,240 @@
-// serverless-функция Vercel (CommonJS)
+// api/submit.js
+// Vercel Node Serverless Function
 
+// --- ENV ---
 const {
-  TG_TOKEN,
-  TG_CHAT,
-  TG_ADMIN,
-  ALLOW_ORIGIN = '',
+  TG_TOKEN = '',
+  TG_CHAT = '',      // публичный канал/чат
+  TG_ADMIN = '',     // админский канал/чат
+  ALLOW_ORIGIN = '', // список доменов, через запятую: "https://gkbsz.su,https://www.gkbsz.su"
+  // Upstash Redis (любой из вариантов)
   KV_REST_API_URL,
-  KV_REST_API_TOKEN
+  KV_REST_API_TOKEN,
+  UPSTASH_REDIS_REST_URL,
+  UPSTASH_REDIS_REST_TOKEN,
 } = process.env;
 
-// ------- helpers -------
+// --- CORS allow-list ---
+const ALLOWED = ALLOW_ORIGIN
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
-function parseAllowList(str) {
-  const bare = (str || '').split(',').map(s => s.trim()).filter(Boolean);
-  // для каждого домена добавим http/https и www-варианты
-  const out = new Set();
-  for (const d of bare) {
-    const host = d.replace(/^https?:\/\//, '');
-    const variants = [
-      `http://${host}`,
-      `https://${host}`,
-      `http://www.${host.replace(/^www\./, '')}`,
-      `https://www.${host.replace(/^www\./, '')}`
-    ];
-    variants.forEach(v => out.add(v));
-  }
-  return Array.from(out);
-}
+// --- Upstash REST helper (без зависимостей) ---
+const REDIS_URL = KV_REST_API_URL || UPSTASH_REDIS_REST_URL || '';
+const REDIS_TOKEN = KV_REST_API_TOKEN || UPSTASH_REDIS_REST_TOKEN || '';
 
-const ORIGINS = parseAllowList(ALLOW_ORIGIN);
-
-function corsHeaders(origin) {
-  const allow = ORIGINS.includes(origin) ? origin : '';
-  const h = {
-    'Vary': 'Origin',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Max-Age': '600'
-  };
-  if (allow) h['Access-Control-Allow-Origin'] = allow;
-  return h;
-}
-
-function getIP(req) {
-  const xf = req.headers['x-forwarded-for'];
-  if (typeof xf === 'string') return xf.split(',')[0].trim();
-  return (req.socket && req.socket.remoteAddress) || '0.0.0.0';
-}
-
-async function upstash(cmdPath) {
-  if (!KV_REST_API_URL || !KV_REST_API_TOKEN) return null;
-  const r = await fetch(`${KV_REST_API_URL}/${cmdPath}`, {
-    headers: { Authorization: `Bearer ${KV_REST_API_TOKEN}` }
+async function redis(cmd, ...args) {
+  if (!REDIS_URL || !REDIS_TOKEN) return null;
+  const body = { cmd: [cmd, ...args] };
+  const r = await fetch(REDIS_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${REDIS_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
   });
-  return r.ok ? r.json() : null;
+  if (!r.ok) return null;
+  const data = await r.json().catch(() => null);
+  return data?.result ?? null;
 }
 
-async function isRateLimited(ip) {
-  // 20 запросов в 5 минут на IP
-  const key = `rl:${ip}`;
-  const r1 = await upstash(`incr/${encodeURIComponent(key)}`);
-  const count = Number(r1?.result || 0);
-  if (count === 1) await upstash(`expire/${encodeURIComponent(key)}/300`);
-  return count > 20;
+// --- Rate Limit: max 20 запросов за 5 минут на IP ---
+async function rateLimit(ip) {
+  try {
+    if (!REDIS_URL || !REDIS_TOKEN) return { ok: true };
+    const key = `form:rate:${ip}`;
+    const count = await redis('INCR', key);
+    if (Number(count) === 1) await redis('EXPIRE', key, 300); // 5 минут
+    if (Number(count) > 20) return { ok: false, reason: 'rate' };
+    return { ok: true };
+  } catch {
+    // если редис недоступен — не ломаем отправку
+    return { ok: true };
+  }
 }
 
-function isEmail(s) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s || '').trim());
+// --- Утилиты ---
+const json = (res, status, data, corsOrigin) => {
+  res.status(status);
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  if (corsOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.send(JSON.stringify(data));
+};
+
+const okOrigin = origin =>
+  origin && ALLOWED.some(allowed => allowed.toLowerCase() === origin.toLowerCase());
+
+// форматирование телефона по E.164 -> "+7 (927) 127-85-33" для RU/KZ; иначе просто E.164
+function formatPhoneE164(e164) {
+  const s = String(e164 || '').replace(/[^\d+]/g, '');
+  if (!s.startsWith('+')) return s || '';
+  const digits = s.replace(/\D/g, '');
+  // +7XXXXXXXXXX (11 цифр включая "7")
+  if (digits.length === 11 && digits.startsWith('7')) {
+    const p = digits;
+    return `+7 (${p.slice(1, 4)}) ${p.slice(4, 7)}-${p.slice(7, 9)}-${p.slice(9, 11)}`;
+  }
+  // +375XXXXXXXXX (BY)
+  if (digits.length === 13 && digits.startsWith('375')) {
+    const cc = '+375';
+    const rest = digits.slice(3);
+    return `${cc} (${rest.slice(0, 2)}) ${rest.slice(2, 5)}-${rest.slice(5, 7)}-${rest.slice(7, 9)}`;
+  }
+  // fallback: как есть
+  return s;
 }
 
-function isE164(s) {
-  return /^\+\d{8,15}$/.test(String(s || '').trim());
-}
-
-function countryFromDial(dial) {
-  // минимальная карта для СНГ/Европы, fallback "Неизвестно"
-  const map = {
-    '7': 'Россия/Казахстан',
+// Страна по ISO2, если фронт не прислал — по коду
+function countryFromPayload({ country_name, country_iso, country_dial, phone_e164 }) {
+  if (country_name) return country_name;
+  const mapDial = {
+    '7': 'Россия',
     '375': 'Беларусь',
-    '380': 'Украина',
-    '374': 'Армения',
-    '373': 'Молдова',
-    '992': 'Таджикистан',
-    '993': 'Туркменистан',
-    '994': 'Азербайджан',
-    '996': 'Киргизия',
-    '998': 'Узбекистан',
-    '995': 'Грузия',
+    '76': 'Казахстан',
+    '77': 'Казахстан',
   };
-  // ищем самый длинный префикс
-  const keys = Object.keys(map).sort((a,b)=>b.length-a.length);
-  for (const k of keys) if (dial.startsWith(k)) return map[k];
-  return 'Неизвестно';
+  const dial = String(country_dial || '').trim();
+  if (mapDial[dial]) return mapDial[dial];
+  const m = String(phone_e164 || '').match(/^\+(\d{1,3})/);
+  if (m && mapDial[m[1]]) return mapDial[m[1]];
+  if (country_iso) return country_iso.toUpperCase();
+  return '-';
 }
 
-function phonePretty({ phone, dial, e164 }) {
-  // если на фронте прислали national в скобках — покажем "+код national"
-  const nat = String(phone || '').trim();
-  if (dial && nat) return `+${dial} ${nat}`;
-  return e164 || nat || '';
-}
+// Ограничение длины для телеги
+const clip = (s, n = 600) => (s && s.length > n ? s.slice(0, n) + '…' : (s || ''));
 
+// Телега
 async function tgSend(chatId, text) {
-  const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
-  const body = { chat_id: chatId, text, disable_web_page_preview: true };
-  const r = await fetch(url, {
+  if (!TG_TOKEN || !chatId) return;
+  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  return r.json();
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      disable_web_page_preview: true,
+    }),
+  }).catch(() => null);
 }
 
-// ------- handler -------
-
-module.exports = async (req, res) => {
+// --- Handler ---
+export default async function handler(req, res) {
   const origin = req.headers.origin || '';
-  const headers = corsHeaders(origin);
+  const corsOrigin = okOrigin(origin) ? origin : '';
 
-  // CORS preflight
+  // Preflight
   if (req.method === 'OPTIONS') {
-    Object.entries(headers).forEach(([k, v]) => res.setHeader(k, v));
-    res.status(204).send('');
-    return;
-  }
-
-  if (!ORIGINS.includes(origin)) {
-    Object.entries(headers).forEach(([k, v]) => res.setHeader(k, v));
-    return res.status(403).json({ ok: false, error: 'Forbidden origin' });
+    if (!corsOrigin) return json(res, 403, { ok: false, error: 'forbidden' });
+    res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+    res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Vary', 'Origin');
+    return res.status(200).end();
   }
 
   if (req.method !== 'POST') {
-    Object.entries(headers).forEach(([k, v]) => res.setHeader(k, v));
-    return res.status(405).json({ ok: false, error: 'Method Not Allowed' });
+    return json(res, 405, { ok: false, error: 'method_not_allowed' }, corsOrigin);
   }
+
+  if (!corsOrigin) {
+    return json(res, 403, { ok: false, error: 'forbidden' });
+  }
+
+  // Читаем тело
+  let body = {};
+  try {
+    body = req.body && typeof req.body === 'object'
+      ? req.body
+      : JSON.parse(req.body || '{}');
+  } catch {
+    return json(res, 400, { ok: false, error: 'invalid_json' }, corsOrigin);
+  }
+
+  const ip =
+    req.headers['x-real-ip'] ||
+    req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+    req.socket?.remoteAddress ||
+    '0.0.0.0';
+
+  // Honeypot / таймер
+  if (String(body.hp || '').trim() !== '') {
+    return json(res, 200, { ok: true, bot: true }, corsOrigin);
+  }
+  if (Number(body.t || 0) < 500) {
+    return json(res, 400, { ok: false, error: 'too_fast' }, corsOrigin);
+  }
+
+  // Rate limit
+  const rl = await rateLimit(ip);
+  if (!rl.ok) {
+    return json(res, 429, { ok: false, error: 'rate_limited' }, corsOrigin);
+  }
+
+  // Валидация
+  const name = String(body.name || '').trim();
+  const email = String(body.email || '').trim();
+  const phone_national = String(body.phone || '').trim(); // то, что ввёл пользователь
+  const phone_e164 = String(body.phone_e164 || '').trim();
+  const subscribe = !!body.subscribe;
+  const userMsg = String(body.message || '').trim();
+
+  if (!name) return json(res, 400, { ok: false, error: 'name' }, corsOrigin);
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return json(res, 400, { ok: false, error: 'email' }, corsOrigin);
+  }
+  if (!/^\+\d{8,15}$/.test(phone_e164)) {
+    return json(res, 400, { ok: false, error: 'phone' }, corsOrigin);
+  }
+
+  const when = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const url = String(body.url || origin || '-');
+  const ua = String(body.ua || req.headers['user-agent'] || '-');
+  const policy_version = String(body.policy_version || '-');
+
+  const country = countryFromPayload(body);
+  const phoneFormatted = formatPhoneE164(phone_e164);
+
+  // --- ПУБЛИЧНОЕ сообщение (добавили Сообщение:) ---
+  const pub =
+    `🎟 Новая заявка\n` +
+    `Имя: ${name}\n` +
+    `Email: ${email}\n` +
+    `Страна: ${country}\n` +
+    `Телефон: ${phoneFormatted}\n` +
+    (userMsg ? `Сообщение: ${clip(userMsg)}\n` : '') +
+    `Подписка: ${subscribe ? 'да' : 'нет'}\n` +
+    `URL: ${url}`;
+
+  // --- АДМИНСКОЕ (подробно) ---
+  const adm =
+    `Заявка (подробно)\n` +
+    `Имя: ${name}\n` +
+    `Email: ${email}\n` +
+    `Телефон: ${phoneFormatted}\n` +
+    `E164: ${phone_e164}\n` +
+    `Страна: ${country}\n` +
+    `Подписка: ${subscribe ? 'да' : 'нет'}\n` +
+    (userMsg ? `Сообщение: ${clip(userMsg, 1200)}\n` : '') +
+    `Политика: ${policy_version}\n` +
+    `Когда: ${when}\n` +
+    `URL: ${url}\n` +
+    `UA: ${ua}\n` +
+    `IP: ${ip}\n` +
+    `Origin: ${origin || '-'}`;
 
   try {
-    const ip = getIP(req);
-
-    // rate limit
-    if (await isRateLimited(ip)) {
-      Object.entries(headers).forEach(([k, v]) => res.setHeader(k, v));
-      return res.status(429).json({ ok: false, error: 'Too Many Requests' });
-    }
-
-    // тело (Vercel уже парсит JSON, но на всякий)
-    const body = typeof req.body === 'object' ? req.body : JSON.parse(req.body || '{}');
-
-    const {
-      name = '',
-      email = '',
-      phone = '',
-      phone_e164 = '',
-      country_name = '',
-      country_iso = '',
-      country_dial = '',
-      subscribe = false,
-      policy_version = '',
-      url = '',
-      ua = '',
-      hp = '',
-      t = 0,
-      message = ''
-    } = body;
-
-    // honeypot / время заполнения
-    if (hp && hp.trim().length > 0) {
-      Object.entries(headers).forEach(([k, v]) => res.setHeader(k, v));
-      return res.status(200).json({ ok: true }); // тихо игнорим ботов
-    }
-    if (Number(t) < 800) {
-      Object.entries(headers).forEach(([k, v]) => res.setHeader(k, v));
-      return res.status(400).json({ ok: false, error: 'Form filled too fast' });
-    }
-
-    // валидация
-    if (!String(name).trim()) throw new Error('name');
-    if (!isEmail(email)) throw new Error('email');
-    if (!isE164(phone_e164)) throw new Error('phone');
-
-    // страна (если фронт не прислал name — пытаемся по dial)
-    const country = (country_name || '').split(' (')[0] ||
-                    countryFromDial(String(country_dial || phone_e164.replace(/^\+/, '')));
-
-    const phoneLine = phonePretty({ phone, dial: country_dial, e164: phone_e164 });
-
-    // публичное сообщение
-    const pub =
-      `🎟 Новая заявка\n` +
-      `Имя: ${name}\n` +
-      `Email: ${email}\n` +
-      `Страна: ${country}\n` +
-      `Телефон: ${phoneLine}\n` +
-      `Согласие на рассылку: ${subscribe ? 'да' : 'нет'}\n` +
-      (message ? `Сообщение: ${message}\n` : '') +
-      `URL: ${url}`;
-
-    // админское
-    const when = new Date().toISOString().replace('T', ' ').slice(0, 19);
-    const adm =
-      `Заявка (подробно)\n` +
-      `Имя: ${name}\n` +
-      `Email: ${email}\n` +
-      `Телефон: ${phoneLine}\n` +
-      `E164: ${phone_e164}\n` +
-      `Страна: ${country} (${country_iso || '-'})\n` +
-      `Согласие на рассылку: ${subscribe ? 'да' : 'нет'}\n` +
-      (message ? `Сообщение: ${message}\n` : '') +
-      `Политика: ${policy_version || '-'}\n` +
-      `Когда: ${when}\n` +
-      `URL: ${url}\n` +
-      `UA: ${ua}\n` +
-      `IP: ${ip}\n` +
-      `Origin: ${origin}`;
-
-    // шлём в TG
+    // отправка в телеграм
     await tgSend(TG_CHAT, pub);
     await tgSend(TG_ADMIN, adm);
-
-    Object.entries(headers).forEach(([k, v]) => res.setHeader(k, v));
-    return res.status(200).json({ ok: true });
   } catch (e) {
-    console.error(e);
-    Object.entries(corsHeaders(origin)).forEach(([k, v]) => res.setHeader(k, v));
-    return res.status(500).json({ ok: false, error: 'Server error' });
+    return json(res, 500, { ok: false, error: 'tg_send_failed' }, corsOrigin);
   }
-};
+
+  return json(res, 200, { ok: true }, corsOrigin);
+}
