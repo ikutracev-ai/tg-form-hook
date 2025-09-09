@@ -32,7 +32,7 @@ function pickEnv() {
     kvToken: e.KV_REST_API_TOKEN || e.UPSTASH_REDIS_REST_TOKEN || e.UPSTASH_REDIS_REST_API_TOKEN,
 
     // ratelimit
-    RATE_LIMIT: Number(e.RATE_LIMIT || 20),      // запросов
+    RATE_LIMIT: Number(e.RATE_LIMIT || 10),      // запросов
     RATE_WINDOW: Number(e.RATE_WINDOW || 300),   // сек
   };
 }
