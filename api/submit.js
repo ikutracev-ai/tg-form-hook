@@ -192,7 +192,8 @@ module.exports = async (req, res) => {
       `Email: ${email}\n` +
       `Страна: ${country}\n` +
       `Телефон: ${phoneLine}\n` +
-      `Подписка: ${subscribe ? 'да' : 'нет'}\n` +
+      `Согласие на рассылку: ${subscribe ? 'да' : 'нет'}\n` +
+      (message ? `Сообщение: ${message}\n` : '') +
       `URL: ${url}`;
 
     // админское
@@ -204,7 +205,7 @@ module.exports = async (req, res) => {
       `Телефон: ${phoneLine}\n` +
       `E164: ${phone_e164}\n` +
       `Страна: ${country} (${country_iso || '-'})\n` +
-      `Подписка: ${subscribe ? 'да' : 'нет'}\n` +
+      `Согласие на рассылку: ${subscribe ? 'да' : 'нет'}\n` +
       (message ? `Сообщение: ${message}\n` : '') +
       `Политика: ${policy_version || '-'}\n` +
       `Когда: ${when}\n` +
