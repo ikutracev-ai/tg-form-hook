@@ -1,194 +1,216 @@
 // /api/submit.js
 export default async function handler(req, res) {
-  // ---------- CORS ----------
-  const origin = req.headers.origin || '';
-  const allow = (process.env.ALLOW_ORIGIN || '')
+  // ---------- CORS (по hostname, а не по протоколу) ----------
+  const allowedHosts = (process.env.ALLOW_ORIGIN || '')
     .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+    .map(s => s.trim().replace(/^https?:\/\//, ''))
+    .filter(Boolean); // например: ['gkbsz.su','www.gkbsz.su']
 
-  if (allow.length === 0 || allow.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', allow.length ? origin : '*');
-  } else {
-    return res.status(403).json({ ok: false, error: 'Origin not allowed' });
-  }
+  const origin = req.headers.origin || '';
+  let originHost = '';
+  try { originHost = new URL(origin).hostname; } catch {}
+
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method === 'OPTIONS') {
+    // preflight всегда 200
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    return res.status(200).end();
+  }
+
+  const corsOk = origin && allowedHosts.includes(originHost);
+  if (corsOk) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else {
+    return res
+      .status(403)
+      .json({ ok: false, error: 'Origin not allowed', origin, originHost });
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ ok: false, error: 'Method not allowed' });
   }
 
-  // ---------- Rate limit (Upstash REST) ----------
-  const clientIp = getClientIp(req);
-  const rl = await checkRateLimit(clientIp).catch(() => ({ limited: false, remaining: 20, resetSec: 0 }));
-  if (rl.limited) {
-    res.setHeader('Retry-After', String(rl.resetSec || 60));
-    return res.status(429).json({ ok: false, error: 'Too many requests' });
+  // ---------- Чтение/валидация входных данных ----------
+  try {
+    const {
+      name = '',
+      email = '',
+      phone = '',
+      phone_e164 = '',
+      subscribe = false,
+      policy_version = '',
+      ua = '',
+      url = '',
+      hp = '',
+      t = 0,
+    } = req.body || {};
+
+    // Антибот
+    if (hp && String(hp).trim() !== '') {
+      return res.status(400).json({ ok: false, error: 'Bot detected' });
+    }
+    if (Number(t) < 600) {
+      return res.status(400).json({ ok: false, error: 'Too fast' });
+    }
+
+    // Простая серверная валидация
+    const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email));
+    const phoneOk = /^\+\d{8,15}$/.test(String(phone_e164)); // E.164
+    const nameOk = String(name).trim().length >= 2;
+
+    if (!nameOk || !emailOk || !phoneOk) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing or invalid fields',
+        details: { nameOk, emailOk, phoneOk },
+      });
+    }
+
+    // ---------- Rate limit (Upstash Redis REST) — опционально ----------
+    const ip =
+      (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+      req.socket?.remoteAddress ||
+      '0.0.0.0';
+
+    const rateLimitOk = await tryRateLimit(ip, 20, 300); // 20 запросов за 5 минут
+    if (!rateLimitOk) {
+      return res.status(429).json({ ok: false, error: 'Too many requests' });
+    }
+
+    // ---------- Формирование сообщений ----------
+    const now = new Date();
+    const when = now.toLocaleString('ru-RU');
+    const shortText =
+      `🎟 Новая заявка\n` +
+      `Имя: ${name}\n` +
+      `Email: ${email}\n` +
+      `Телефон: ${phone || phone_e164}\n` +
+      `Подписка: ${subscribe ? 'да' : 'нет'}\n` +
+      `Политика: ${policy_version || '-'}\n` +
+      `Время: ${when}\n` +
+      `URL: ${url || '-'}\n` +
+      `UA: ${ua || '-'}`;
+
+    const fullText =
+      `🧾 Заявка (подробно)\n` +
+      `Имя: ${name}\n` +
+      `Email: ${email}\n` +
+      `Телефон: ${phone || phone_e164}\n` +
+      `E164: ${phone_e164}\n` +
+      `Подписка: ${subscribe ? 'да' : 'нет'}\n` +
+      `Политика: ${policy_version || '-'}\n` +
+      `Когда: ${when}\n` +
+      `URL: ${url || '-'}\n` +
+      `UA: ${ua || '-'}\n` +
+      `IP: ${ip}\n` +
+      `Origin: ${origin}`;
+
+    // ---------- Отправка в Telegram ----------
+    const token = process.env.TG_TOKEN;
+    const chatId = process.env.TG_CHAT;
+    const adminId = process.env.TG_ADMIN;
+
+    if (!token || !chatId) {
+      return res
+        .status(500)
+        .json({ ok: false, error: 'Server not configured: TG_TOKEN/TG_CHAT' });
+    }
+
+    const tgBase = `https://api.telegram.org/bot${token}`;
+
+    // 1) короткая — в основной канал
+    const r1 = await fetch(`${tgBase}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: shortText }),
+    });
+
+    // 2) полная — админу (если указан TG_ADMIN)
+    let r2ok = true;
+    if (adminId) {
+      const r2 = await fetch(`${tgBase}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: adminId, text: fullText }),
+      });
+      r2ok = r2.ok;
+    }
+
+    if (!r1.ok || !r2ok) {
+      const j1 = await safeJson(r1);
+      return res.status(502).json({
+        ok: false,
+        error: 'Telegram error',
+        details: j1 || {},
+      });
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
-
-  // ---------- Payload ----------
-  let body = req.body || {};
-  if (typeof body === 'string') {
-    try { body = JSON.parse(body); } catch { body = {}; }
-  }
-
-  const {
-    name = '',
-    email = '',
-    phone = '',
-    phone_e164 = '',
-    subscribe = false,
-    policy_version = '',
-    ua = '',
-    url = '',
-    hp = '',
-    t = 0,
-    country = '' // можно присылать с фронта; иначе возьмём из хедера Vercel
-  } = body;
-
-  // anti-bot
-  if (hp) return res.status(400).json({ ok: false, error: 'Bot detected' });
-  if (t && Number(t) < 500) return res.status(400).json({ ok: false, error: 'Bot detected' });
-
-  // ---------- Server-side validation ----------
-  if (!isValidName(name))   return res.status(400).json({ ok: false, error: 'Bad name' });
-  if (!isValidEmail(email)) return res.status(400).json({ ok: false, error: 'Bad email' });
-
-  const e164 = String(phone_e164 || '').trim();
-  if (!/^\+\d{8,15}$/.test(e164)) {
-    return res.status(400).json({ ok: false, error: 'Bad phone' });
-  }
-
-  // ---------- Telegram config ----------
-  const token   = process.env.TG_TOKEN;
-  const chatId  = process.env.TG_CHAT;
-  const adminId = process.env.TG_ADMIN;
-
-  if (!token || !chatId) {
-    return res.status(500).json({ ok: false, error: 'Server not configured: TG_TOKEN/TG_CHAT' });
-  }
-
-  // ---------- Compose messages ----------
-  const when = new Date().toLocaleString('ru-RU');
-  const headerCountry = req.headers['x-vercel-ip-country'] || '';
-  const countryFinal = (country || headerCountry || '-').toString();
-
-  const yesno = subscribe ? 'да' : 'нет';
-
-  const mainText = [
-    '📬 <b>Новая заявка</b>',
-    `Имя: ${escapeHTML(name)}`,
-    `Email: ${escapeHTML(email)}`,
-    `Телефон: ${escapeHTML(e164 || phone)}`,
-    `Страна: ${escapeHTML(countryFinal)}`,
-    `Подписка: ${yesno}`,
-    `Страница: ${escapeHTML(url || '-')}`
-  ].join('\n');
-
-  const adminText = [
-    '🛠 <b>Новая заявка (расширенная)</b>',
-    `Имя: ${escapeHTML(name)}`,
-    `Email: ${escapeHTML(email)}`,
-    `Телефон: ${escapeHTML(e164 || phone)}`,
-    `Страна (client/header): ${escapeHTML(country || '')} / ${escapeHTML(headerCountry)}`,
-    `Подписка: ${yesno}`,
-    `Политика: ${escapeHTML(policy_version || '-')}`,
-    `Время: ${when}`,
-    `URL: ${escapeHTML(url || '-')}`,
-    `UA: ${escapeHTML(ua || '-')}`,
-    `IP: ${escapeHTML(clientIp)}`,
-    `RL: осталось ${rl.remaining ?? '-'}; окно ${rl.resetSec ? rl.resetSec + 'с' : '-'}`
-  ].join('\n');
-
-  // ---------- Send to Telegram ----------
-  const sendMain  = sendTG(token, chatId,  mainText);
-  const sendAdmin = adminId ? sendTG(token, adminId, adminText) : Promise.resolve({ ok: true });
-
-  const [rMain, rAdm] = await Promise.all([sendMain, sendAdmin]).catch(() => [{ ok: false }, { ok: false }]);
-
-  if (!rMain.ok) {
-    return res.status(502).json({ ok: false, error: 'Telegram error (main)', details: rMain });
-  }
-  if (adminId && !rAdm.ok) {
-    // не валим заявку, просто сообщаем что админ-уведомление не дошло
-    return res.status(200).json({ ok: true, warn: 'Admin notify failed' });
-  }
-
-  return res.status(200).json({ ok: true });
 }
 
-/* ===================== helpers ===================== */
+/**
+ * Мягкий rate-limit через Upstash Redis REST API.
+ * поддерживаются переменные:
+ *  - KV_REST_API_URL + KV_REST_API_TOKEN
+ *  - или UPSTASH_REDIS_REST_API_URL + UPSTASH_REDIS_REST_API_TOKEN
+ * Если ничего не задано — возвращает true (без ограничения).
+ */
+async function tryRateLimit(ip, limit = 20, ttlSec = 300) {
+  const url =
+    process.env.KV_REST_API_URL ||
+    process.env.UPSTASH_REDIS_REST_API_URL ||
+    process.env.UPSTASH_REDIS_REST_KV_REST_API_URL || // на случай других префиксов
+    process.env.UPSTASH_REDIS_REST_KV_API_URL ||
+    '';
 
-function getClientIp(req) {
-  const xf = (req.headers['x-forwarded-for'] || '').toString();
-  const ip = xf.split(',')[0].trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || '';
-  return ip.toString();
+  const token =
+    process.env.KV_REST_API_TOKEN ||
+    process.env.UPSTASH_REDIS_REST_API_TOKEN ||
+    process.env.UPSTASH_REDIS_REST_KV_REST_API_TOKEN ||
+    process.env.UPSTASH_REDIS_REST_KV_API_TOKEN ||
+    '';
+
+  if (!url || !token) return true;
+
+  const key = `ratelimit:${ip}`;
+  try {
+    // INCR
+    const incr = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ cmd: 'INCR', args: [key] }),
+    });
+    const incrJson = await safeJson(incr);
+    const count = Array.isArray(incrJson) ? incrJson[1] : incrJson?.result ?? 0;
+
+    if (Number(count) === 1) {
+      // первый инкремент — ставим EXPIRE
+      await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ cmd: 'EXPIRE', args: [key, ttlSec] }),
+      });
+    }
+    return Number(count) <= Number(limit);
+  } catch (e) {
+    console.warn('RateLimit error (skipped):', e?.message);
+    return true; // не ломаем поток, если RL недоступен
+  }
 }
 
-function isValidName(v) {
-  const s = String(v || '').trim();
-  return s.length >= 2 && s.length <= 80;
-}
-function isValidEmail(v) {
-  const s = String(v || '').trim();
-  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s);
-}
-
-function escapeHTML(s) {
-  return String(s || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
-// Upstash REST (Redis) — фиксированное окно 5 минут, лимит 20
-async function checkRateLimit(ip) {
-  const url = process.env.KV_REST_API_URL;
-  const token = process.env.KV_REST_API_TOKEN;
-  const WINDOW = 300;  // секунд
-  const LIMIT  = 20;
-
-  if (!url || !token) return { limited: false, remaining: LIMIT, resetSec: 0 };
-
-  const key = `rl:submit:${ip}`;
-
-  const r = await fetch(`${url}/pipeline`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      commands: [
-        ['INCR', key],
-        ['EXPIRE', key, String(WINDOW), 'NX'],
-        ['PTTL', key]
-      ]
-    })
-  });
-
-  const out = await r.json().catch(() => null);
-  const count = Number(out?.[0]?.result ?? 0);
-  const pttl  = Number(out?.[2]?.result ?? WINDOW * 1000);
-  const reset = Math.max(0, Math.ceil(pttl / 1000));
-
-  return { limited: count > LIMIT, remaining: Math.max(0, LIMIT - count), resetSec: reset };
-}
-
-async function sendTG(token, chatId, text) {
-  const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true
-    })
-  });
-  const json = await resp.json().catch(() => null);
-  return { ok: resp.ok && json?.ok, status: resp.status, json };
+async function safeJson(r) {
+  try { return await r.json(); } catch { return null; }
 }
